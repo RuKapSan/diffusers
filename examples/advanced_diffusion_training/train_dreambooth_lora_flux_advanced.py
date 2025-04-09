@@ -1097,78 +1097,102 @@ class DreamBoothDataset(Dataset):
 
     def __getitem__(self, index):
         example = {}
-        # instance_image = self.pixel_values[index % self.num_instance_images] # Removed
+        # Переменная теперь может содержать путь или объект Image
+        image_source = self.instance_paths_repeated[index % self.num_instance_images]
 
-        # --- Modification: Load and process image here ---
-        img_path = self.instance_paths_repeated[index % self.num_instance_images]
-        try: # Add error handling for loading
-            image = Image.open(img_path)
-            image = exif_transpose(image)
+        try:
+            # Проверяем тип источника изображения
+            if isinstance(image_source, Image.Image):
+                # Если это уже объект PIL Image, используем его напрямую
+                image = image_source.copy() # Копируем на всякий случай, чтобы не изменить оригинал в кэше datasets
+            elif isinstance(image_source, (str, Path)):
+                # Если это строка или Path, открываем файл
+                image = Image.open(image_source)
+                # exif_transpose имеет смысл только при открытии из файла
+                image = exif_transpose(image)
+            else:
+                # Обрабатываем непредвиденный тип, если нужно
+                raise TypeError(f"Unexpected type for image_source: {type(image_source)} from {self.instance_paths_repeated}")
+
+            # --- Дальнейшая обработка 'image' остается прежней ---
+            # (Извлечение альфа-канала, конвертация в RGB, трансформации)
+
+            alpha_mask_np = None
+            if self.alpha_mask_required: # Use the flag
+                if image.mode == "RGBA":
+                    try:
+                        alpha = image.split()[-1]
+                        alpha_mask_np = np.array(alpha, dtype=np.uint8)
+                        alpha_mask_np = (alpha_mask_np > 127).astype(np.uint8) # Threshold 127 for binarization
+                        image = image.convert("RGB")
+                    except Exception as e:
+                        logger.warning(f"Could not process alpha channel for source: {image_source}. Using RGB only. Error: {e}")
+                        if image.mode != "RGB":
+                            image = image.convert("RGB")
+                        alpha_mask_np = None # Reset mask on error
+                elif image.mode != "RGB": # If not RGBA but also not RGB, convert
+                    logger.warning(f"Image source {image_source} is not RGB or RGBA ({image.mode}). Converting to RGB.")
+                    image = image.convert("RGB")
+            # Если маскирование не требуется, но изображение не RGB, конвертируем
+            elif image.mode != "RGB":
+                 image = image.convert("RGB")
+
+
+            # Применяем трансформации к RGB изображению
+            if not image.mode == "RGB": # Финальная проверка перед трансформациями
+                 image = image.convert("RGB")
+
+            # --- Применение трансформаций ---
+            image = self.train_resize(image)
+            if args.random_flip and random.random() < 0.5:
+                image = self.train_flip(image)
+            if args.center_crop:
+                y1 = max(0, int(round((image.height - args.resolution) / 2.0)))
+                x1 = max(0, int(round((image.width - args.resolution) / 2.0)))
+                image = self.train_crop(image)
+            else:
+                y1, x1, h, w = self.train_crop.get_params(image, (args.resolution, args.resolution))
+                image = crop(image, y1, x1, h, w)
+            image_tensor = self.train_transforms(image)
+            # --- Конец трансформаций ---
+
+            example["instance_images"] = image_tensor
+            example["instance_masks"] = alpha_mask_np # Добавляем маску (может быть None)
+
+            # --- Обработка промптов и классовых изображений (остается без изменений) ---
+            if self.custom_instance_prompts:
+                 # ... (existing code for handling custom_instance_prompts) ...
+                 # Убедитесь, что эта логика совместима, если вы ее используете
+                 # raise NotImplementedError("Custom instance prompts not fully checked with alpha mask")
+                prompt_index = index % len(self.custom_instance_prompts) # Handle potential index mismatch if lengths differ
+                example["instance_prompt"] = self.custom_instance_prompts[prompt_index]
+            else:
+                example["instance_prompt"] = self.instance_prompt
+
+            if self.class_data_root:
+                # ... (existing code for class images, оно должно работать, т.к. class_images_path - это пути) ...
+                try: # Error handling for class images
+                    class_image_path = self.class_images_path[index % self.num_class_images]
+                    class_image = Image.open(class_image_path)
+                    class_image = exif_transpose(class_image)
+                    if not class_image.mode == "RGB":
+                        class_image = class_image.convert("RGB")
+                    example["class_images"] = self.class_image_transforms(class_image) # Use separate transforms
+                    example["class_prompt"] = self.class_prompt
+                except Exception as e:
+                    logger.error(f"Could not load/process class image at path: {class_image_path}. Error: {e}")
+                    example["class_images"] = None
+                    example["class_prompt"] = None # Also None to avoid mismatch
+                # Add None mask for class images as they shouldn't be masked
+                example["class_masks"] = None
+
         except Exception as e:
-            logger.error(f"Could not load image at path: {img_path}. Error: {e}")
-            # Return None to skip this example in collate_fn
+            # Логируем исходный источник для ясности
+            logger.error(f"Could not load/process image source: {image_source}. Error: {e}")
+            # Возвращаем None, чтобы пропустить этот пример в collate_fn
             return None
 
-        alpha_mask_np = None
-        if self.alpha_mask_required: # Use the flag
-            if image.mode == "RGBA":
-                try:
-                    alpha = image.split()[-1]
-                    # Convert alpha to binary NumPy mask (0 or 1)
-                    alpha_mask_np = np.array(alpha, dtype=np.uint8)
-                    alpha_mask_np = (alpha_mask_np > 127).astype(np.uint8) # Threshold 127 for binarization
-                    image = image.convert("RGB")
-                except Exception as e:
-                    logger.warning(f"Could not process alpha channel for {img_path}. Using RGB only. Error: {e}")
-                    if image.mode != "RGB":
-                         image = image.convert("RGB")
-                    alpha_mask_np = None # Reset mask on error
-            elif image.mode != "RGB": # If not RGBA but also not RGB, convert
-                 logger.warning(f"Image at {img_path} is not RGB or RGBA ({image.mode}). Converting to RGB.")
-                 image = image.convert("RGB")
-            # else: # If image is RGB, mask remains None
-
-        # Apply transformations to the RGB image
-        if not image.mode == "RGB": # Final check
-             image = image.convert("RGB")
-        image = self.train_resize(image)
-        if args.random_flip and random.random() < 0.5:
-            image = self.train_flip(image)
-        if args.center_crop:
-            y1 = max(0, int(round((image.height - args.resolution) / 2.0)))
-            x1 = max(0, int(round((image.width - args.resolution) / 2.0)))
-            image = self.train_crop(image)
-        else:
-            y1, x1, h, w = self.train_crop.get_params(image, (args.resolution, args.resolution))
-            image = crop(image, y1, x1, h, w)
-        image_tensor = self.train_transforms(image)
-        # --- End modification ---
-
-        example["instance_images"] = image_tensor
-        example["instance_masks"] = alpha_mask_np # Add mask (can be None)
-
-        if self.custom_instance_prompts:
-            # ... (existing code for handling custom_instance_prompts) ...
-             raise NotImplementedError("Custom instance prompts not fully checked with alpha mask")
-        else:  # the given instance prompt is used for all images
-            example["instance_prompt"] = self.instance_prompt
-
-        if self.class_data_root:
-            try: # Error handling for class images
-                class_image = Image.open(self.class_images_path[index % self.num_class_images])
-                class_image = exif_transpose(class_image)
-                if not class_image.mode == "RGB":
-                    class_image = class_image.convert("RGB")
-                example["class_images"] = self.class_image_transforms(class_image) # Use separate transforms
-                example["class_prompt"] = self.class_prompt
-            except Exception as e:
-                 logger.error(f"Could not load/process class image at path: {self.class_images_path[index % self.num_class_images]}. Error: {e}")
-                 # If class image failed, return None for class_images?
-                 example["class_images"] = None
-                 example["class_prompt"] = None # Also None to avoid mismatch
-            # Add None mask for class images as they shouldn't be masked
-            example["class_masks"] = None
-
+        return example
         return example
 
 
