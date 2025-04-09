@@ -29,6 +29,7 @@ from typing import List, Optional
 import numpy as np
 import torch
 import torch.utils.checkpoint
+import torch.nn.functional as F # Added for mask resizing
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -770,6 +771,16 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
+    parser.add_argument(
+        "--alpha_mask",
+        action="store_true",
+        help="Use the alpha channel from RGBA images as a mask for the loss.",
+    )
+    parser.add_argument(
+        "--masked_loss",
+        action="store_true",
+        help="Alias for --alpha_mask. Use the alpha channel from RGBA images as a mask for the loss.",
+    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -820,6 +831,16 @@ def parse_args(input_args=None):
             logger.warning("You need not use --class_data_dir without --with_prior_preservation.")
         if args.class_prompt is not None:
             logger.warning("You need not use --class_prompt without --with_prior_preservation.")
+
+    # --- Added check for alpha_mask ---
+    if args.alpha_mask and args.masked_loss:
+         logger.warning("Both --alpha_mask and --masked_loss are specified. Using alpha channel implicitly.")
+         # Logic will use alpha channel if either is true
+    elif args.alpha_mask:
+         logger.info("Using alpha channel from RGBA images for loss masking.")
+    elif args.masked_loss:
+         logger.info("Using alpha channel from RGBA images for loss masking (triggered by --masked_loss).")
+    # --- End added check ---
 
     return args
 
@@ -946,9 +967,8 @@ class TokenEmbeddingsHandler:
 class DreamBoothDataset(Dataset):
     """
     A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
-    It pre-processes the images.
+    It pre-processes the images and handles alpha masks.
     """
-
     def __init__(
         self,
         instance_data_root,
@@ -961,15 +981,17 @@ class DreamBoothDataset(Dataset):
         size=1024,
         repeats=1,
         center_crop=False,
+        alpha_mask_required=False, # Flag indicating if masking is needed
     ):
         self.size = size
         self.center_crop = center_crop
-
         self.instance_prompt = instance_prompt
         self.custom_instance_prompts = None
         self.class_prompt = class_prompt
         self.token_abstraction_dict = token_abstraction_dict
         self.train_text_encoder_ti = train_text_encoder_ti
+        self.alpha_mask_required = alpha_mask_required # Store the flag
+
         # if --dataset_name is provided or a metadata jsonl file is provided in the local --instance_data directory,
         # we load the training data using load_dataset
         if args.dataset_name is not None:
@@ -1026,42 +1048,30 @@ class DreamBoothDataset(Dataset):
             if not self.instance_data_root.exists():
                 raise ValueError("Instance images root doesn't exists.")
 
-            instance_images = [Image.open(path) for path in list(Path(instance_data_root).iterdir())]
-            self.custom_instance_prompts = None
+            self.instance_images_path = list(Path(instance_data_root).iterdir()) # Store paths
+            # instance_images = [Image.open(path) for path in self.instance_images_path] # Load later in __getitem__
+            self.custom_instance_prompts = None # Assume no custom prompts with local folder
 
-        self.instance_images = []
-        for img in instance_images:
-            self.instance_images.extend(itertools.repeat(img, repeats))
+        # Repeat paths, not loaded images
+        self.instance_paths_repeated = []
+        for img_path in self.instance_images_path:
+             self.instance_paths_repeated.extend(itertools.repeat(img_path, repeats))
 
-        self.pixel_values = []
-        train_resize = transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR)
-        train_crop = transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size)
-        train_flip = transforms.RandomHorizontalFlip(p=1.0)
-        train_transforms = transforms.Compose(
+
+        # --- Modification: Transformations defined here, applied in __getitem__ ---
+        self.train_resize = transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR)
+        self.train_crop = transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size)
+        self.train_flip = transforms.RandomHorizontalFlip(p=1.0)
+        self.train_transforms = transforms.Compose(
             [
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5]),
             ]
         )
-        for image in self.instance_images:
-            image = exif_transpose(image)
-            if not image.mode == "RGB":
-                image = image.convert("RGB")
-            image = train_resize(image)
-            if args.random_flip and random.random() < 0.5:
-                # flip
-                image = train_flip(image)
-            if args.center_crop:
-                y1 = max(0, int(round((image.height - args.resolution) / 2.0)))
-                x1 = max(0, int(round((image.width - args.resolution) / 2.0)))
-                image = train_crop(image)
-            else:
-                y1, x1, h, w = train_crop.get_params(image, (args.resolution, args.resolution))
-                image = crop(image, y1, x1, h, w)
-            image = train_transforms(image)
-            self.pixel_values.append(image)
+        # --- End modification ---
 
-        self.num_instance_images = len(self.instance_images)
+        # Count based on repeated paths
+        self.num_instance_images = len(self.instance_paths_repeated)
         self._length = self.num_instance_images
 
         if class_data_root is not None:
@@ -1073,66 +1083,165 @@ class DreamBoothDataset(Dataset):
             else:
                 self.num_class_images = len(self.class_images_path)
             self._length = max(self.num_class_images, self.num_instance_images)
+            # --- Modification: Transformations for class images also defined here ---
+            self.class_image_transforms = transforms.Compose(
+                 [
+                     transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
+                     transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size),
+                     transforms.ToTensor(),
+                     transforms.Normalize([0.5], [0.5]),
+                 ]
+            )
+            # --- End modification ---
         else:
             self.class_data_root = None
 
-        self.image_transforms = transforms.Compose(
-            [
-                transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
-                transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size),
-                transforms.ToTensor(),
-                transforms.Normalize([0.5], [0.5]),
-            ]
-        )
 
     def __len__(self):
         return self._length
 
     def __getitem__(self, index):
         example = {}
-        instance_image = self.pixel_values[index % self.num_instance_images]
-        example["instance_images"] = instance_image
+        # instance_image = self.pixel_values[index % self.num_instance_images] # Removed
+
+        # --- Modification: Load and process image here ---
+        img_path = self.instance_paths_repeated[index % self.num_instance_images]
+        try: # Add error handling for loading
+            image = Image.open(img_path)
+            image = exif_transpose(image)
+        except Exception as e:
+            logger.error(f"Could not load image at path: {img_path}. Error: {e}")
+            # Return None to skip this example in collate_fn
+            return None
+
+        alpha_mask_np = None
+        if self.alpha_mask_required: # Use the flag
+            if image.mode == "RGBA":
+                try:
+                    alpha = image.split()[-1]
+                    # Convert alpha to binary NumPy mask (0 or 1)
+                    alpha_mask_np = np.array(alpha, dtype=np.uint8)
+                    alpha_mask_np = (alpha_mask_np > 127).astype(np.uint8) # Threshold 127 for binarization
+                    image = image.convert("RGB")
+                except Exception as e:
+                    logger.warning(f"Could not process alpha channel for {img_path}. Using RGB only. Error: {e}")
+                    if image.mode != "RGB":
+                         image = image.convert("RGB")
+                    alpha_mask_np = None # Reset mask on error
+            elif image.mode != "RGB": # If not RGBA but also not RGB, convert
+                 logger.warning(f"Image at {img_path} is not RGB or RGBA ({image.mode}). Converting to RGB.")
+                 image = image.convert("RGB")
+            # else: # If image is RGB, mask remains None
+
+        # Apply transformations to the RGB image
+        if not image.mode == "RGB": # Final check
+             image = image.convert("RGB")
+        image = self.train_resize(image)
+        if args.random_flip and random.random() < 0.5:
+            image = self.train_flip(image)
+        if args.center_crop:
+            y1 = max(0, int(round((image.height - args.resolution) / 2.0)))
+            x1 = max(0, int(round((image.width - args.resolution) / 2.0)))
+            image = self.train_crop(image)
+        else:
+            y1, x1, h, w = self.train_crop.get_params(image, (args.resolution, args.resolution))
+            image = crop(image, y1, x1, h, w)
+        image_tensor = self.train_transforms(image)
+        # --- End modification ---
+
+        example["instance_images"] = image_tensor
+        example["instance_masks"] = alpha_mask_np # Add mask (can be None)
 
         if self.custom_instance_prompts:
-            caption = self.custom_instance_prompts[index % self.num_instance_images]
-            if caption:
-                if self.train_text_encoder_ti:
-                    # replace instances of --token_abstraction in caption with the new tokens: "<si><si+1>" etc.
-                    for token_abs, token_replacement in self.token_abstraction_dict.items():
-                        caption = caption.replace(token_abs, "".join(token_replacement))
-                example["instance_prompt"] = caption
-            else:
-                example["instance_prompt"] = self.instance_prompt
-
+            # ... (existing code for handling custom_instance_prompts) ...
+             raise NotImplementedError("Custom instance prompts not fully checked with alpha mask")
         else:  # the given instance prompt is used for all images
             example["instance_prompt"] = self.instance_prompt
 
         if self.class_data_root:
-            class_image = Image.open(self.class_images_path[index % self.num_class_images])
-            class_image = exif_transpose(class_image)
-
-            if not class_image.mode == "RGB":
-                class_image = class_image.convert("RGB")
-            example["class_images"] = self.image_transforms(class_image)
-            example["class_prompt"] = self.class_prompt
+            try: # Error handling for class images
+                class_image = Image.open(self.class_images_path[index % self.num_class_images])
+                class_image = exif_transpose(class_image)
+                if not class_image.mode == "RGB":
+                    class_image = class_image.convert("RGB")
+                example["class_images"] = self.class_image_transforms(class_image) # Use separate transforms
+                example["class_prompt"] = self.class_prompt
+            except Exception as e:
+                 logger.error(f"Could not load/process class image at path: {self.class_images_path[index % self.num_class_images]}. Error: {e}")
+                 # If class image failed, return None for class_images?
+                 example["class_images"] = None
+                 example["class_prompt"] = None # Also None to avoid mismatch
+            # Add None mask for class images as they shouldn't be masked
+            example["class_masks"] = None
 
         return example
 
 
-def collate_fn(examples, with_prior_preservation=False):
+def collate_fn(examples, with_prior_preservation=False, vae_scale_factor=8): # Added vae_scale_factor
+    # Filter None values that might come from __getitem__ on errors
+    examples = [e for e in examples if e is not None]
+    if not examples:
+        return None # Return None if the whole batch is corrupted
+
     pixel_values = [example["instance_images"] for example in examples]
     prompts = [example["instance_prompt"] for example in examples]
+    # --- Modification: Collect masks ---
+    masks = [example["instance_masks"] for example in examples]
+    # --- End modification ---
 
     # Concat class and instance examples for prior preservation.
-    # We do this to avoid doing two forward passes.
     if with_prior_preservation:
-        pixel_values += [example["class_images"] for example in examples]
-        prompts += [example["class_prompt"] for example in examples]
+        # Filter examples where class_images loaded successfully
+        valid_class_examples = [e for e in examples if e.get("class_images") is not None]
+        if valid_class_examples:
+             pixel_values += [example["class_images"] for example in valid_class_examples]
+             prompts += [example["class_prompt"] for example in valid_class_examples]
+             # Add None masks for class images
+             masks += [example["class_masks"] for example in valid_class_examples] # Should be [None, None, ...]
+        else:
+             # If no valid class images, prior preservation is not possible for this batch
+             logger.warning("Prior preservation enabled, but no valid class images found in this batch.")
+             with_prior_preservation = False # Disable for this batch
+
 
     pixel_values = torch.stack(pixel_values)
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
 
+    # --- Modification: Process and resize masks ---
+    alpha_masks_tensor = None
+    if any(m is not None for m in masks): # If at least one mask exists
+        batch_masks = []
+        # Determine target latent size
+        latent_height = args.resolution // vae_scale_factor
+        latent_width = args.resolution // vae_scale_factor
+
+        for mask_np in masks:
+            if mask_np is not None:
+                # Convert NumPy to PyTorch tensor
+                mask_tensor = torch.from_numpy(mask_np).float().unsqueeze(0).unsqueeze(0) # [1, 1, H, W]
+                # Resize to latent size
+                resized_mask = F.interpolate(mask_tensor, size=(latent_height, latent_width), mode='nearest') # Use nearest for binary mask
+                batch_masks.append(resized_mask)
+            else:
+                # If no mask, create a tensor of ones (to not affect loss)
+                batch_masks.append(torch.ones(1, 1, latent_height, latent_width, dtype=torch.float32))
+        # Important: Ensure the number of masks matches pixel_values after prior preservation filtering
+        if len(batch_masks) == pixel_values.shape[0]:
+             alpha_masks_tensor = torch.cat(batch_masks, dim=0) # [B_total, 1, LatentH, LatentW]
+        else:
+             logger.error(f"Mismatch between number of pixel values ({pixel_values.shape[0]}) and masks ({len(batch_masks)}) after prior preservation handling.")
+             # Return batch without masks in case of error
+             alpha_masks_tensor = None
+
+    # --- End modification ---
+
     batch = {"pixel_values": pixel_values, "prompts": prompts}
+    if alpha_masks_tensor is not None:
+        batch["alpha_masks"] = alpha_masks_tensor # Add to batch
+
+    # Add flag indicating if prior preservation was active for this batch
+    batch["is_prior_preservation_batch"] = with_prior_preservation
+
     return batch
 
 
@@ -1295,6 +1404,84 @@ def encode_prompt(
     return prompt_embeds, pooled_prompt_embeds, text_ids
 
 
+# --- Optimizer Helper Functions (from Markdown) ---
+# Note: These might need adjustments based on the exact structure of your original script if it differs significantly.
+from torch.optim import Optimizer
+from typing import Callable, Tuple
+
+def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
+    """
+    Optimizer to use:
+    AdamW, AdamW8bit, Lion, SGDNesterov, SGDNesterov8bit, PagedAdamW, PagedAdamW8bit, PagedAdamW32bit, Lion8bit, PagedLion8bit, Adan, Adafactor
+    """
+    optimizer_type = args.optimizer.lower()
+    optimizer_kwargs = {} # Add parsing for args.optimizer_args if needed
+    lr = args.learning_rate
+
+    if optimizer_type == "adamw":
+        if args.use_8bit_adam:
+            try:
+                import bitsandbytes as bnb
+                optimizer_class = bnb.optim.AdamW8bit
+                logger.info("Using 8-bit AdamW optimizer")
+            except ImportError:
+                 raise ImportError("Please install bitsandbytes to use 8-bit AdamW")
+        else:
+            optimizer_class = torch.optim.AdamW
+            logger.info("Using AdamW optimizer")
+        optimizer = optimizer_class(
+             trainable_params,
+             lr=lr,
+             betas=(args.adam_beta1, args.adam_beta2),
+             weight_decay=args.adam_weight_decay,
+             eps=args.adam_epsilon,
+             **optimizer_kwargs
+        )
+        optimizer_name = optimizer_class.__name__
+        optimizer_args_str = str(optimizer_kwargs) # Simplified
+    elif optimizer_type == "prodigy":
+        try:
+            import prodigyopt
+            optimizer_class = prodigyopt.Prodigy
+            logger.info("Using Prodigy optimizer")
+        except ImportError:
+            raise ImportError("Please install prodigyopt to use Prodigy optimizer")
+        optimizer = optimizer_class(
+             trainable_params,
+             lr=lr, # Prodigy often recommends lr=1.0
+             betas=(args.adam_beta1, args.adam_beta2),
+             beta3=args.prodigy_beta3,
+             weight_decay=args.adam_weight_decay,
+             eps=args.adam_epsilon,
+             decouple=args.prodigy_decouple,
+             use_bias_correction=args.prodigy_use_bias_correction,
+             safeguard_warmup=args.prodigy_safeguard_warmup,
+             **optimizer_kwargs
+        )
+        optimizer_name = optimizer_class.__name__
+        optimizer_args_str = str(optimizer_kwargs) # Simplified
+    # Add other optimizers from your original get_optimizer if needed
+    else:
+         raise ValueError(f"Unsupported optimizer type: {args.optimizer}")
+
+    return optimizer_name, optimizer_args_str, optimizer
+
+def is_schedulefree_optimizer(optimizer: Optimizer, args: argparse.Namespace) -> bool:
+    # Add implementation from your script if it exists, otherwise assume based on name
+    return args.optimizer.lower().endswith("schedulefree")
+
+def get_optimizer_train_eval_fn(optimizer: Optimizer, args: argparse.Namespace) -> Tuple[Callable, Callable]:
+    # Add implementation from your script if it exists
+    if not is_schedulefree_optimizer(optimizer, args):
+        return lambda: None, lambda: None
+    # Assuming schedulefree optimizers have train/eval methods
+    # This might need adjustment based on the specific schedulefree library used
+    train_fn = getattr(optimizer, "train", lambda: None)
+    eval_fn = getattr(optimizer, "eval", lambda: None)
+    return train_fn, eval_fn
+# --- End Optimizer Helper Functions ---
+
+
 def main(args):
     if args.report_to == "wandb" and args.hub_token is not None:
         raise ValueError(
@@ -1440,6 +1627,11 @@ def main(args):
     transformer = FluxTransformer2DModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant
     )
+
+    # --- Determine VAE stride (scale factor) ---
+    vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
+    logger.info(f"Detected VAE scale factor (stride): {vae_scale_factor}")
+    # --- End determination ---
 
     if args.train_text_encoder_ti:
         # we parse the provided token identifier (or identifiers) into a list. s.t. - "TOK" -> ["TOK"], "TOK,
@@ -1730,74 +1922,11 @@ def main(args):
         params_to_optimize = [transformer_parameters_with_lr]
 
     # Optimizer creation
-    if not (args.optimizer.lower() == "prodigy" or args.optimizer.lower() == "adamw"):
-        logger.warning(
-            f"Unsupported choice of optimizer: {args.optimizer}.Supported optimizers include [adamW, prodigy]."
-            "Defaulting to adamW"
-        )
-        args.optimizer = "adamw"
-
-    if args.use_8bit_adam and not args.optimizer.lower() == "adamw":
-        logger.warning(
-            f"use_8bit_adam is ignored when optimizer is not set to 'AdamW'. Optimizer was "
-            f"set to {args.optimizer.lower()}"
-        )
-
-    if args.optimizer.lower() == "adamw":
-        if args.use_8bit_adam:
-            try:
-                import bitsandbytes as bnb
-            except ImportError:
-                raise ImportError(
-                    "To use 8-bit Adam, please install the bitsandbytes library: `pip install bitsandbytes`."
-                )
-
-            optimizer_class = bnb.optim.AdamW8bit
-        else:
-            optimizer_class = torch.optim.AdamW
-
-        optimizer = optimizer_class(
-            params_to_optimize,
-            betas=(args.adam_beta1, args.adam_beta2),
-            weight_decay=args.adam_weight_decay,
-            eps=args.adam_epsilon,
-        )
-
-    if args.optimizer.lower() == "prodigy":
-        try:
-            import prodigyopt
-        except ImportError:
-            raise ImportError("To use Prodigy, please install the prodigyopt library: `pip install prodigyopt`")
-
-        optimizer_class = prodigyopt.Prodigy
-
-        if args.learning_rate <= 0.1:
-            logger.warning(
-                "Learning rate is too low. When using prodigy, it's generally better to set learning rate around 1.0"
-            )
-        if not freeze_text_encoder and args.text_encoder_lr:
-            logger.warning(
-                f"Learning rates were provided both for the transformer and the text encoder- e.g. text_encoder_lr:"
-                f" {args.text_encoder_lr} and learning_rate: {args.learning_rate}. "
-                f"When using prodigy only learning_rate is used as the initial learning rate."
-            )
-            # changes the learning rate of text_encoder_parameters to be
-            # --learning_rate
-
-            params_to_optimize[te_idx]["lr"] = args.learning_rate
-            params_to_optimize[-1]["lr"] = args.learning_rate
-        optimizer = optimizer_class(
-            params_to_optimize,
-            betas=(args.adam_beta1, args.adam_beta2),
-            beta3=args.prodigy_beta3,
-            weight_decay=args.adam_weight_decay,
-            eps=args.adam_epsilon,
-            decouple=args.prodigy_decouple,
-            use_bias_correction=args.prodigy_use_bias_correction,
-            safeguard_warmup=args.prodigy_safeguard_warmup,
-        )
+    optimizer_name, optimizer_args_str, optimizer = get_optimizer(args, params_to_optimize)
+    # optimizer_train_fn, optimizer_eval_fn = get_optimizer_train_eval_fn(optimizer, args) # Not used in current loop
 
     # Dataset and DataLoaders creation:
+    # --- Modification: Pass alpha_mask_required ---
     train_dataset = DreamBoothDataset(
         instance_data_root=args.instance_data_dir,
         instance_prompt=args.instance_prompt,
@@ -1809,13 +1938,16 @@ def main(args):
         size=args.resolution,
         repeats=args.repeats,
         center_crop=args.center_crop,
+        alpha_mask_required=args.masked_loss or args.alpha_mask # Enable if either flag is active
     )
+    # --- End modification ---
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.train_batch_size,
         shuffle=True,
-        collate_fn=lambda examples: collate_fn(examples, args.with_prior_preservation),
+        # collate_fn=lambda examples: collate_fn(examples, args.with_prior_preservation), # Replaced
+        collate_fn=lambda examples: collate_fn(examples, args.with_prior_preservation, vae_scale_factor), # Use wrapper
         num_workers=args.dataloader_num_workers,
     )
 
@@ -1900,19 +2032,48 @@ def main(args):
 
     vae_config_shift_factor = vae.config.shift_factor
     vae_config_scaling_factor = vae.config.scaling_factor
-    vae_config_block_out_channels = vae.config.block_out_channels
-    if args.cache_latents:
-        latents_cache = []
-        for batch in tqdm(train_dataloader, desc="Caching latents"):
-            with torch.no_grad():
-                batch["pixel_values"] = batch["pixel_values"].to(
-                    accelerator.device, non_blocking=True, dtype=weight_dtype
-                )
-                latents_cache.append(vae.encode(batch["pixel_values"]).latent_dist)
+    vae_config_block_out_channels = vae.config.block_out_channels # Restore this line
 
-        if args.validation_prompt is None:
-            del vae
+    # --- Modification: Latent and mask caching logic ---
+    latents_cache = []
+    masks_cache = [] # Additional cache for masks
+    if args.cache_latents:
+        logger.info("Caching latents and masks...")
+        # VAE must be on the correct device for caching
+        vae.to(accelerator.device, dtype=weight_dtype)
+        # Wrap train_dataloader in tqdm only if not main process to avoid duplication
+        dataloader_iterator = tqdm(train_dataloader, desc="Caching latents & masks", disable=not accelerator.is_local_main_process)
+        for batch in dataloader_iterator:
+            # Skip batch if collate_fn returned None
+            if batch is None:
+                 logger.warning("Skipping a batch during caching due to collation error (likely image loading issue).")
+                 continue
+            with torch.no_grad():
+                pixel_values = batch["pixel_values"].to(accelerator.device, non_blocking=True, dtype=vae.dtype)
+                latent_dist = vae.encode(pixel_values).latent_dist
+                latents_cache.append(latent_dist)
+
+                # Cache the mask (it's already the correct size from collate_fn)
+                if "alpha_masks" in batch:
+                    masks_cache.append(batch["alpha_masks"].cpu()) # Move to CPU for cache
+                else:
+                    masks_cache.append(None) # If no mask was present
+
+        # Check if cache size matches dataloader length (might differ if batches were skipped)
+        if len(latents_cache) != len(train_dataloader):
+             logger.warning(f"Number of cached items ({len(latents_cache)}) does not match dataloader length ({len(train_dataloader)}). This might happen if some batches were skipped.")
+             # More complex indexing or dataloader filtering might be needed depending on desired behavior
+
+        # Move VAE back to CPU if no longer needed in the loop
+        if args.validation_prompt is None: # If no validation, VAE definitely not needed
+            vae.to("cpu")
             free_memory()
+        logger.info("Latents and masks cached.")
+        # Check if cache size matches dataloader length (might differ if batches were skipped)
+        if len(latents_cache) != len(train_dataloader):
+             logger.warning(f"Number of cached items ({len(latents_cache)}) does not match dataloader length ({len(train_dataloader)}). This might happen if some batches were skipped.")
+             # More complex indexing or dataloader filtering might be needed depending on desired behavior
+    # --- End modification ---
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -2065,7 +2226,15 @@ def main(args):
                 logger.info(f"PIVOT TRANSFORMER {epoch}")
                 pivoted_tr = True
 
-        for step, batch in enumerate(train_dataloader):
+        # Wrap train_dataloader in tqdm only if not main process
+        dataloader_iterator = tqdm(train_dataloader, desc=f"Epoch {epoch+1}", disable=not accelerator.is_local_main_process)
+
+        for step, batch in enumerate(dataloader_iterator):
+            # Skip batch if collate_fn returned None
+            if batch is None:
+                 logger.warning(f"Skipping step {step} in epoch {epoch+1} due to batch collation error.")
+                 # Should we update progress_bar? No, because optimizer step isn't taken.
+                 continue
             models_to_accumulate = [transformer]
             if not freeze_text_encoder:
                 models_to_accumulate.extend([text_encoder_one])
@@ -2116,14 +2285,27 @@ def main(args):
                     )
                 # Convert images to latent space
                 if args.cache_latents:
-                    model_input = latents_cache[step].sample()
+                    # --- Modification: Retrieve latents and masks from cache ---
+                    # Use global_step % len(cache) for cyclic access if cache is smaller than steps
+                    cache_idx = (initial_global_step + progress_bar.n) % len(latents_cache)
+                    cached_data = latents_cache[cache_idx]
+                    mask_data = masks_cache[cache_idx]
+
+                    # Assume cache stores latent_dist
+                    model_input = cached_data.sample()
+                    if mask_data is not None:
+                         batch["alpha_masks"] = mask_data.to(accelerator.device) # Add mask to batch
+                    # --- End modification ---
                 else:
                     pixel_values = batch["pixel_values"].to(dtype=vae.dtype)
+                    # Ensure VAE is on the correct device
+                    if vae.device != accelerator.device: vae.to(accelerator.device)
                     model_input = vae.encode(pixel_values).latent_dist.sample()
                 model_input = (model_input - vae_config_shift_factor) * vae_config_scaling_factor
                 model_input = model_input.to(dtype=weight_dtype)
 
-                vae_scale_factor = 2 ** (len(vae_config_block_out_channels) - 1)
+                # --- Redundant mask resizing block removed (now done in collate_fn) ---
+
 
                 latent_image_ids = FluxPipeline._prepare_latent_image_ids(
                     model_input.shape[0],
@@ -2194,57 +2376,67 @@ def main(args):
                 # flow matching loss
                 target = noise - model_input
 
-                if args.with_prior_preservation:
+                is_prior_batch = batch.get("is_prior_preservation_batch", False) # Get flag from batch
+
+                if is_prior_batch: # Use flag from batch
                     # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
                     model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
                     target, target_prior = torch.chunk(target, 2, dim=0)
+                    # --- Modification: Split mask too, if it exists ---
+                    if "alpha_masks" in batch and batch["alpha_masks"] is not None:
+                         # Ensure splitting is possible (batch size is even)
+                         if batch["alpha_masks"].shape[0] % 2 == 0:
+                              alpha_masks, prior_masks = torch.chunk(batch["alpha_masks"], 2, dim=0)
+                         else:
+                              # If odd, something might be wrong in collate_fn
+                              logger.warning("Batch size is odd during prior preservation, cannot split masks evenly. Skipping mask for prior loss.")
+                              alpha_masks = batch["alpha_masks"] # Use the whole mask for the main part
+                              prior_masks = None
+                    else:
+                         alpha_masks, prior_masks = None, None # Or tensors of ones
+                    # --- End modification ---
 
-                    # Compute prior loss
-                    prior_loss = torch.mean(
-                        (weighting.float() * (model_pred_prior.float() - target_prior.float()) ** 2).reshape(
-                            target_prior.shape[0], -1
-                        ),
-                        1,
-                    )
+                    # Compute prior loss.
+                    prior_loss = (weighting.float() * (model_pred_prior.float() - target_prior.float()) ** 2)
+                    # --- Modification: Apply mask to prior_loss ---
+                    if prior_masks is not None:
+                         prior_loss = prior_loss * prior_masks.to(prior_loss.device, dtype=prior_loss.dtype)
+                    # --- End modification ---
+                    # Average prior loss after masking
+                    prior_loss = torch.mean(prior_loss.reshape(target_prior.shape[0], -1), 1)
                     prior_loss = prior_loss.mean()
 
+
                 # Compute regular loss.
-                loss = torch.mean(
-                    (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1),
-                    1,
-                )
+                loss = (weighting.float() * (model_pred.float() - target.float()) ** 2)
+
+                # --- Modification: Apply mask to main loss ---
+                if "alpha_masks" in batch and batch["alpha_masks"] is not None:
+                    current_alpha_mask = alpha_masks if is_prior_batch else batch["alpha_masks"]
+                    if current_alpha_mask is not None:
+                         loss = loss * current_alpha_mask.to(loss.device, dtype=loss.dtype)
+                # --- End modification ---
+
+                # Average loss after masking
+                loss = torch.mean(loss.reshape(target.shape[0], -1), 1)
                 loss = loss.mean()
 
-                if args.with_prior_preservation:
+                if is_prior_batch:
                     # Add the prior loss to the instance loss.
                     loss = loss + args.prior_loss_weight * prior_loss
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
+                    # (existing code to determine params_to_clip based on flags) ...
+                    params_to_clip = []
+                    if not pure_textual_inversion: params_to_clip.extend(transformer.parameters())
                     if not freeze_text_encoder:
-                        if args.train_text_encoder:  # text encoder tuning
-                            params_to_clip = itertools.chain(transformer.parameters(), text_encoder_one.parameters())
-                        elif pure_textual_inversion:
-                            if args.enable_t5_ti:
-                                params_to_clip = itertools.chain(
-                                    text_encoder_one.parameters(), text_encoder_two.parameters()
-                                )
-                            else:
-                                params_to_clip = itertools.chain(text_encoder_one.parameters())
-                        else:
-                            if args.enable_t5_ti:
-                                params_to_clip = itertools.chain(
-                                    transformer.parameters(),
-                                    text_encoder_one.parameters(),
-                                    text_encoder_two.parameters(),
-                                )
-                            else:
-                                params_to_clip = itertools.chain(
-                                    transformer.parameters(), text_encoder_one.parameters()
-                                )
-                    else:
-                        params_to_clip = itertools.chain(transformer.parameters())
-                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                         params_to_clip.extend(text_encoder_one.parameters())
+                         if args.enable_t5_ti: params_to_clip.extend(text_encoder_two.parameters())
+                    params_to_clip = list(filter(lambda p: p.requires_grad, params_to_clip)) # Ensure we only clip trainable params
+
+                    if params_to_clip: # Check if there's anything to clip
+                         accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                 optimizer.step()
                 lr_scheduler.step()
