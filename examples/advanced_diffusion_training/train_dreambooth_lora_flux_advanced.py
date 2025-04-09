@@ -1033,6 +1033,11 @@ class DreamBoothDataset(Dataset):
                 self.custom_instance_prompts = []
                 for caption in custom_instance_prompts:
                     self.custom_instance_prompts.extend(itertools.repeat(caption, repeats))
+
+            # ---> ADDED THIS LINE <---
+            # Assign instance_images to instance_images_path
+            self.instance_images_path = list(instance_images)
+            # ---> END ADDITION <---
         else:
             self.instance_data_root = Path(instance_data_root)
             if not self.instance_data_root.exists():
