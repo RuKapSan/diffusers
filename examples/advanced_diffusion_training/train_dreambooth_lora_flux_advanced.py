@@ -832,16 +832,6 @@ def parse_args(input_args=None):
         if args.class_prompt is not None:
             logger.warning("You need not use --class_prompt without --with_prior_preservation.")
 
-    # --- Added check for alpha_mask ---
-    if args.alpha_mask and args.masked_loss:
-         logger.warning("Both --alpha_mask and --masked_loss are specified. Using alpha channel implicitly.")
-         # Logic will use alpha channel if either is true
-    elif args.alpha_mask:
-         logger.info("Using alpha channel from RGBA images for loss masking.")
-    elif args.masked_loss:
-         logger.info("Using alpha channel from RGBA images for loss masking (triggered by --masked_loss).")
-    # --- End added check ---
-
     return args
 
 
@@ -1522,6 +1512,16 @@ def main(args):
         level=logging.INFO,
     )
     logger.info(accelerator.state, main_process_only=False)
+
+    # ---> ADDED BLOCK HERE <---
+    if accelerator.is_main_process: # Log only on the main process
+         if args.alpha_mask and args.masked_loss:
+              logger.warning("Both --alpha_mask and --masked_loss are specified. Using alpha channel implicitly.")
+         elif args.alpha_mask:
+              logger.info("Using alpha channel from RGBA images for loss masking.")
+         elif args.masked_loss:
+              logger.info("Using alpha channel from RGBA images for loss masking (triggered by --masked_loss).")
+    # ---> END ADDED BLOCK <---
     if accelerator.is_local_main_process:
         transformers.utils.logging.set_verbosity_warning()
         diffusers.utils.logging.set_verbosity_info()
