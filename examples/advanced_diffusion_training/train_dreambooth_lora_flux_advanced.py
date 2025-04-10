@@ -432,6 +432,12 @@ def parse_args(input_args=None):
         help=("The dimension of the LoRA update matrices."),
     )
     parser.add_argument(
+        "--lora_alpha",
+        type=float,
+        default=None,
+        help="The alpha parameter for LoRA scaling. Defaults to `rank` if not specified.",
+    )
+    parser.add_argument(
         "--with_prior_preservation",
         default=False,
         action="store_true",
@@ -1762,7 +1768,7 @@ def main(args):
     # now we will add new LoRA weights to the attention layers
     transformer_lora_config = LoraConfig(
         r=args.rank,
-        lora_alpha=args.rank,
+        lora_alpha=args.lora_alpha if args.lora_alpha else args.rank,
         init_lora_weights="gaussian",
         target_modules=target_modules,
     )
@@ -1770,7 +1776,7 @@ def main(args):
     if args.train_text_encoder:
         text_lora_config = LoraConfig(
             r=args.rank,
-            lora_alpha=args.rank,
+            lora_alpha=args.lora_alpha if args.lora_alpha else args.rank,
             init_lora_weights="gaussian",
             target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
         )
