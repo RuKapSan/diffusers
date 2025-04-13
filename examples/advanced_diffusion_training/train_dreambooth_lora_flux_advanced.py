@@ -2760,7 +2760,7 @@ def main(args):
 
                 # Check if prior preservation is active for this batch
                 # Assumes collate_fn correctly doubled the batch size if prior preservation was successful
-                is_prior_batch = with_prior_preservation and model_pred.shape[0] == target.shape[0] * 2
+                is_prior_batch = args.with_prior_preservation and model_pred.shape[0] == target.shape[0] * 2
 
                 # Get masks from batch (should exist, potentially as all ones)
                 pixel_masks = batch.get("pixel_masks") # Use the new key from collate_fn
