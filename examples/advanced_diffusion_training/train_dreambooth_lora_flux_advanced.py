@@ -2297,7 +2297,8 @@ def main(args):
         size=args.resolution,
         repeats=args.repeats,
         center_crop=args.center_crop,
-        alpha_mask_required=args.masked_loss or args.alpha_mask # Enable if either flag is active
+        alpha_mask_required=args.masked_loss or args.alpha_mask, # Enable if either flag is active
+        args=args
     )
     # --- End modification ---
 
