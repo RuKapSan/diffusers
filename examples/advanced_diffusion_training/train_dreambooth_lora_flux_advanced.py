@@ -1203,14 +1203,17 @@ class DreamBoothDataset(Dataset):
             # Assign instance_images to instance_images_path
             self.instance_images_path = list(instance_images)
             # ---> END ADDITION <---
-        else:
+        elif instance_data_root is not None: # Check if instance_data_root is provided
             self.instance_data_root = Path(instance_data_root)
             if not self.instance_data_root.exists():
-                raise ValueError("Instance images root doesn't exists.")
+                raise ValueError(f"Instance images root {self.instance_data_root} doesn't exist.")
 
             self.instance_images_path = list(Path(instance_data_root).iterdir()) # Store paths
             # instance_images = [Image.open(path) for path in self.instance_images_path] # Load later in __getitem__
+            # This line belongs inside the instance_data_root handling block
             self.custom_instance_prompts = None # Assume no custom prompts with local folder
+        # Removing the unnecessary 'else' block introduced earlier.
+        # Argument parsing should handle the case where no data source is provided.
 
         # Repeat paths, not loaded images
         self.instance_paths_repeated = []
