@@ -1233,9 +1233,11 @@ class DreamBoothDataset(Dataset):
         )
         # --- End modification ---
 
-        # Count based on repeated paths
-        self.num_instance_images = len(self.instance_paths_repeated)
-        self._length = self.num_instance_images
+        # Removing the incorrect recalculation based on instance_paths_repeated.
+        # The correct self.num_instance_images and self._length are set
+        # within the respective data loading blocks (metadata, dataset, instance_dir).
+        # self.num_instance_images = len(self.instance_paths_repeated) # Incorrect reset
+        # self._length = self.num_instance_images # Incorrect reset
 
         # --- DEBUG PRINT 1 ---
         print(f"DEBUG: After loading, self.num_instance_images = {self.num_instance_images}")
