@@ -1069,6 +1069,9 @@ class DreamBoothDataset(Dataset):
                  repeated_metadata.extend(itertools.repeat(entry, self.repeats))
             self.metadata = repeated_metadata # Replace with repeated list
             self.num_instance_images = len(self.metadata) # Update count based on repeats
+            # --- DEBUG PRINT 1 ---
+            print(f"DEBUG: After metadata repeat, self.num_instance_images = {self.num_instance_images}")
+            # --- END DEBUG ---
 
         # --- Load from HuggingFace dataset if --dataset_name is provided ---
         elif args.dataset_name is not None:
@@ -1202,6 +1205,7 @@ class DreamBoothDataset(Dataset):
             # ---> ADDED THIS LINE <---
             # Assign instance_images to instance_images_path
             self.instance_images_path = list(instance_images)
+            print(f"DEBUG: Found {len(self.instance_images_path)} images in {dataset_name}")
             # ---> END ADDITION <---
         elif instance_data_root is not None: # Check if instance_data_root is provided
             self.instance_data_root = Path(instance_data_root)
@@ -1209,6 +1213,7 @@ class DreamBoothDataset(Dataset):
                 raise ValueError(f"Instance images root {self.instance_data_root} doesn't exist.")
 
             self.instance_images_path = list(Path(instance_data_root).iterdir()) # Store paths
+            print(f"DEBUG: Found {len(self.instance_images_path)} images in {instance_data_root}")
             # instance_images = [Image.open(path) for path in self.instance_images_path] # Load later in __getitem__
             # This line belongs inside the instance_data_root handling block
             self.custom_instance_prompts = None # Assume no custom prompts with local folder
@@ -1254,6 +1259,9 @@ class DreamBoothDataset(Dataset):
         self.num_instance_images = len(self.instance_paths_repeated)
         self._length = self.num_instance_images
 
+        # --- DEBUG PRINT 1 ---
+        print(f"DEBUG: After loading, self.num_instance_images = {self.num_instance_images}")
+
         if class_data_root is not None:
             self.class_data_root = Path(class_data_root)
             self.class_data_root.mkdir(parents=True, exist_ok=True)
@@ -1276,17 +1284,28 @@ class DreamBoothDataset(Dataset):
         else:
             self.class_data_root = None
 
+        # --- DEBUG PRINT 2 ---
+        print(f"DEBUG: End of DreamBoothDataset.__init__, self.num_instance_images = {self.num_instance_images}")
+        # --- END DEBUG ---
+
 
     def __len__(self):
+        len_val = 0 # Значение по умолчанию на случай ошибки
         # The length depends on whether prior preservation is used
         # self.num_instance_images and self.num_class_images should be counts *after* repeating
         if self.class_data_root is not None:
             # The dataloader length is the maximum of instance and class images (after repeats)
             # This ensures we iterate enough times to cover the larger set if counts differ.
-            return max(self.num_instance_images, self.num_class_images)
+            # return max(self.num_instance_images, self.num_class_images)
+            len_val = max(self.num_instance_images, self.num_class_images)
         else:
             # If no prior preservation, length is just the number of instance images (after repeats)
-            return self.num_instance_images
+            # return self.num_instance_images
+            len_val = self.num_instance_images
+        # --- DEBUG PRINT 3 ---
+        print(f"DEBUG: DreamBoothDataset.__len__ called, returning: {len_val}")
+        # --- END DEBUG ---
+        return len_val
 
     def _load_and_process_instance(self, index):
         """Helper function to load and process instance image, prompt, and mask."""
@@ -2322,6 +2341,9 @@ def main(args):
     )
     # --- End modification ---
 
+    # --- DEBUG PRINT 4 ---
+    print(f"DEBUG: Before DataLoader creation, len(train_dataset) = {len(train_dataset)}")
+    # --- END DEBUG ---
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.train_batch_size,
