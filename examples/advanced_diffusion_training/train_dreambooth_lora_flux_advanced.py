@@ -1220,29 +1220,7 @@ class DreamBoothDataset(Dataset):
         # Removing the unnecessary 'else' block introduced earlier.
         # Argument parsing should handle the case where no data source is provided.
 
-        # --- Problematic Block Identified by User ---
-        # This block incorrectly recalculates num_instance_images when using metadata,
-        # as self.instance_images_path is not populated in that case.
-        # The repetition logic for metadata is handled within the metadata loading block itself.
-        # Commenting out this block to prevent self.num_instance_images from being reset to 0.
-        #
-        # # Repeat paths, not loaded images
-        # self.instance_paths_repeated = []
-        # # This loop won't run if self.instance_images_path doesn't exist (e.g., metadata case)
-        # if hasattr(self, 'instance_images_path') and self.instance_images_path:
-        #      for img_path in self.instance_images_path:
-        #           self.instance_paths_repeated.extend(itertools.repeat(img_path, repeats))
-        # else:
-        #      # If instance_images_path wasn't created (metadata case), initialize repeated list
-        #      # This might not be strictly necessary if the variable isn't used later,
-        #      # but added for clarity if the code relies on it existing.
-        #      if not hasattr(self, 'instance_paths_repeated'):
-        #           self.instance_paths_repeated = []
-
-
-        # # Count based on repeated paths (THIS IS THE LINE THAT CAUSES THE ERROR by resetting the count)
-        # self.num_instance_images = len(self.instance_paths_repeated)
-        # --- End Problematic Block ---
+        # Removing the problematic block entirely to ensure it doesn't interfere.
         # --- Modification: Transformations defined here, applied in __getitem__ ---
         self.train_resize = transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR)
         self.train_crop = transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size)
