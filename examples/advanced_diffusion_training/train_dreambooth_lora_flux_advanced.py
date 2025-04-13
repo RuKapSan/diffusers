@@ -22,6 +22,7 @@ import os
 import random
 import re
 import shutil
+import json # Added for metadata loading
 from contextlib import nullcontext
 from pathlib import Path
 from typing import List, Optional
@@ -322,10 +323,16 @@ def parse_args(input_args=None):
         help="The config of the Dataset, leave as None if there's only one config.",
     )
     parser.add_argument(
+        "--metadata_file",
+        type=str,
+        default=None,
+        help="A path to a JSON Lines file (.jsonl) containing metadata (file_name, text, mask_path). Alternative to --instance_data_dir.",
+    )
+    parser.add_argument(
         "--instance_data_dir",
         type=str,
         default=None,
-        help=("A folder containing the training data. "),
+        help=("A folder containing the training data. Ignored if --metadata_file is provided."),
     )
 
     parser.add_argument(
@@ -338,16 +345,20 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--image_column",
         type=str,
-        default="image",
-        help="The column of the dataset containing the target image. By "
-        "default, the standard Image Dataset maps out 'file_name' "
-        "to 'image'.",
+        default="file_name", # Changed default from "image"
+        help="The column/key in the dataset or metadata file containing the relative path to the image.",
     )
     parser.add_argument(
         "--caption_column",
         type=str,
-        default=None,
-        help="The column of the dataset containing the instance prompt for each image",
+        default="text", # Changed default from None
+        help="The column/key in the dataset or metadata file containing the instance prompt for each image.",
+    )
+    parser.add_argument(
+        "--mask_column",
+        type=str,
+        default="mask_path",
+        help="The column/key in the metadata file containing the relative path to the mask image (optional).",
     )
 
     parser.add_argument("--repeats", type=int, default=1, help="How many times to repeat the training data.")
@@ -960,10 +971,14 @@ class TokenEmbeddingsHandler:
             embeds.weight.data[index_updates] = new_embeddings
 
 
+# Added imports for Path and json
+from pathlib import Path
+import json
+
 class DreamBoothDataset(Dataset):
     """
     A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
-    It pre-processes the images and handles alpha masks.
+    It pre-processes the images and handles alpha masks or separate mask files via metadata.
     """
     def __init__(
         self,
@@ -977,7 +992,16 @@ class DreamBoothDataset(Dataset):
         size=1024,
         repeats=1,
         center_crop=False,
-        alpha_mask_required=False, # Flag indicating if masking is needed
+        alpha_mask_required=False, # Flag indicating if masking is needed (for RGBA alpha)
+        # Added args from parse_args needed here
+        metadata_file=None,
+        image_column="file_name",
+        caption_column="text",
+        mask_column="mask_path",
+        dataset_name=None, # Need dataset_name arg
+        dataset_config_name=None, # Need dataset_config_name arg
+        cache_dir=None, # Need cache_dir arg
+        args=None, # Pass full args object
     ):
         self.size = size
         self.center_crop = center_crop
@@ -986,7 +1010,142 @@ class DreamBoothDataset(Dataset):
         self.class_prompt = class_prompt
         self.token_abstraction_dict = token_abstraction_dict
         self.train_text_encoder_ti = train_text_encoder_ti
-        self.alpha_mask_required = alpha_mask_required # Store the flag
+        self.alpha_mask_required = alpha_mask_required # Store the flag for RGBA alpha
+        self.repeats = repeats # Store repeats
+        self.args = args # Store args
+
+        self.metadata = None
+        self.metadata_dir = None
+        self.instance_images_path = [] # Initialize as list
+        self.instance_paths_repeated = [] # Initialize
+
+        # Define image extensions
+        IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
+
+        # --- Load from metadata file if provided ---
+        if args.metadata_file is not None:
+            metadata_file = args.metadata_file # Use from args
+            image_column = args.image_column
+            caption_column = args.caption_column
+            mask_column = args.mask_column
+
+            logger.info(f"Loading dataset from metadata file: {metadata_file}")
+            self.metadata_dir = Path(metadata_file).parent
+            self.metadata = []
+            try:
+                with open(metadata_file, "r", encoding="utf-8") as f:
+                    for line_num, line in enumerate(f):
+                        try:
+                            entry = json.loads(line)
+                            # Basic validation for required keys
+                            if image_column not in entry:
+                                logger.warning(f"Skipping line {line_num+1} in {metadata_file}: Missing key '{image_column}'. Line: {line.strip()}")
+                                continue
+                            if caption_column not in entry:
+                                logger.warning(f"Skipping line {line_num+1} in {metadata_file}: Missing key '{caption_column}'. Line: {line.strip()}")
+                                continue
+                            # Store the valid entry
+                            self.metadata.append(entry)
+                        except json.JSONDecodeError as e:
+                            logger.warning(f"Skipping malformed line {line_num+1} in {metadata_file}: {line.strip()} - Error: {e}")
+            except FileNotFoundError:
+                 raise ValueError(f"Metadata file {metadata_file} not found.")
+
+            self.num_instance_images = len(self.metadata)
+            if self.num_instance_images == 0:
+                raise ValueError(
+                    f"No valid entries found in the metadata file {metadata_file}. "
+                    f"Please check the file format and content (expected keys: '{image_column}', '{caption_column}')."
+                )
+            logger.info(f"Loaded {self.num_instance_images} instance entries from metadata.")
+            # When using metadata, instance_images_path is not used directly for iteration,
+            # but we might store resolved paths if needed elsewhere, or just use metadata directly in __getitem__
+            # For simplicity, let's rely on loading directly from metadata in __getitem__
+            self.instance_data_root = None # Not used
+
+            # Repeat metadata entries if needed (simplest way)
+            repeated_metadata = []
+            for entry in self.metadata:
+                 repeated_metadata.extend(itertools.repeat(entry, self.repeats))
+            self.metadata = repeated_metadata # Replace with repeated list
+            self.num_instance_images = len(self.metadata) # Update count based on repeats
+
+        # --- Load from HuggingFace dataset if --dataset_name is provided ---
+        elif args.dataset_name is not None:
+            dataset_name = args.dataset_name # Use from args
+            logger.info(f"Loading dataset from HuggingFace Hub: {dataset_name}")
+            # (Existing logic from lines 1004-1057 remains here)
+            # ... [omitted for brevity, assume it populates self.instance_images_path and self.custom_instance_prompts] ...
+            # Ensure self.instance_images_path is populated correctly by the existing logic
+            # Repeat paths after loading
+            temp_paths = list(self.instance_images_path) # Get paths loaded by dataset logic
+            self.instance_paths_repeated = []
+            for img_path in temp_paths:
+                 self.instance_paths_repeated.extend(itertools.repeat(img_path, self.repeats))
+            self.num_instance_images = len(self.instance_paths_repeated)
+
+        # --- Load from local directory if --instance_data_dir is provided ---
+        elif instance_data_root is not None:
+            logger.info(f"Loading dataset from local directory: {instance_data_root}")
+            self.instance_data_root = Path(instance_data_root)
+            if not self.instance_data_root.exists():
+                raise ValueError(f"Instance images root {self.instance_data_root} doesn't exist.")
+
+            self.instance_images_path = [
+                p for p in Path(instance_data_root).iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+            ]
+            if not self.instance_images_path:
+                 raise ValueError(f"No images found in {instance_data_root}")
+
+            self.custom_instance_prompts = None # Assume no custom prompts with local folder
+
+            # Repeat paths
+            self.instance_paths_repeated = []
+            for img_path in self.instance_images_path:
+                 self.instance_paths_repeated.extend(itertools.repeat(img_path, self.repeats))
+            self.num_instance_images = len(self.instance_paths_repeated)
+        else:
+            raise ValueError("Must provide either --metadata_file, --dataset_name, or --instance_data_dir")
+
+
+        # --- Common setup after loading data source ---
+        self._length = self.num_instance_images # Length is now based on repeated items
+
+        # Prior preservation setup
+        if class_data_root is not None:
+            # (Existing logic from lines 1089-1097 remains largely the same)
+            # ...
+            self.class_data_root = Path(class_data_root)
+            self.class_data_root.mkdir(parents=True, exist_ok=True)
+            self.class_images_path = [
+                 p for p in self.class_data_root.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+            ]
+            if not self.class_images_path:
+                 raise ValueError(f"No class images found in {class_data_root}")
+
+            if class_num is not None:
+                self.num_class_images = min(len(self.class_images_path), class_num)
+            else:
+                self.num_class_images = len(self.class_images_path)
+
+            # Repeat class paths
+            repeated_class_paths = []
+            # Use only the first class_num paths before repeating
+            paths_to_repeat = self.class_images_path[:self.num_class_images]
+            for path in paths_to_repeat:
+                 repeated_class_paths.extend(itertools.repeat(path, self.repeats))
+            self.class_images_path = repeated_class_paths # Replace with repeated list
+            self.num_class_images = len(self.class_images_path) # Update count
+
+            self._length = max(self.num_instance_images, self.num_class_images)
+            # ... (rest of prior preservation setup)
+        else:
+            self.class_data_root = None
+            self.num_class_images = 0 # Ensure this is 0 if no class data root
+
+        # Transformations (defined here, applied in __getitem__)
+        # Keep existing transform definitions (lines 1073-1082 and 1098-1106)
+        # ... [omitted for brevity] ...
 
         # if --dataset_name is provided or a metadata jsonl file is provided in the local --instance_data directory,
         # we load the training data using load_dataset
@@ -1099,173 +1258,338 @@ class DreamBoothDataset(Dataset):
 
 
     def __len__(self):
-        return self._length
+        # The length depends on whether prior preservation is used
+        # self.num_instance_images and self.num_class_images should be counts *after* repeating
+        if self.class_data_root is not None:
+            # The dataloader length is the maximum of instance and class images (after repeats)
+            # This ensures we iterate enough times to cover the larger set if counts differ.
+            return max(self.num_instance_images, self.num_class_images)
+        else:
+            # If no prior preservation, length is just the number of instance images (after repeats)
+            return self.num_instance_images
+
+    def _load_and_process_instance(self, index):
+        """Helper function to load and process instance image, prompt, and mask."""
+        image = None
+        prompt = None
+        mask = None
+        source_info = "N/A" # For error logging
+
+        try:
+            # --- Loading from Metadata ---
+            if self.metadata is not None:
+                # Use the index directly as metadata list is already repeated
+                item = self.metadata[index]
+                source_info = item
+                image_column = self.args.image_column
+                caption_column = self.args.caption_column
+                mask_column = self.args.mask_column
+
+                image_path_str = item.get(image_column)
+                if not image_path_str: raise ValueError(f"Missing key '{image_column}'")
+                image_path = self.metadata_dir / image_path_str
+                if not image_path.is_file(): raise FileNotFoundError(f"Image not found: {image_path}")
+                image = Image.open(image_path)
+
+                prompt = item.get(caption_column, self.instance_prompt)
+
+                mask_path_str = item.get(mask_column)
+                if mask_path_str:
+                    mask_path = self.metadata_dir / mask_path_str
+                    if mask_path.is_file():
+                        try:
+                            mask = Image.open(mask_path).convert("L") # Load as grayscale
+                        except Exception as e:
+                            logger.warning(f"Could not load/convert mask {mask_path}: {e}. Using default mask.")
+                            mask = None
+                    else:
+                        logger.warning(f"Mask file specified but not found: {mask_path}. Using default mask.")
+                        mask = None
+                # If alpha_mask_required is True, check RGBA even with metadata (might override external mask)
+                elif self.alpha_mask_required and image.mode == "RGBA":
+                     logger.warning(f"Extracting alpha mask from RGBA image {image_path} even though metadata was provided.")
+                     try:
+                         alpha = image.split()[-1]
+                         mask_np = np.array(alpha, dtype=np.uint8)
+                         mask_np = (mask_np > 127).astype(np.uint8) # Threshold
+                         mask = Image.fromarray(mask_np * 255, mode='L')
+                         image = image.convert("RGB")
+                     except Exception as e:
+                         logger.warning(f"Could not process alpha channel for source: {image_path}. Error: {e}")
+                         mask = None
+                         if image.mode != "RGB": image = image.convert("RGB")
+
+            # --- Loading from Directory/Dataset ---
+            else:
+                # Use the index directly as instance_paths_repeated is already repeated
+                image_source = self.instance_paths_repeated[index]
+                source_info = image_source
+                if isinstance(image_source, Image.Image):
+                    image = image_source.copy()
+                elif isinstance(image_source, (str, Path)):
+                    image_path = Path(image_source)
+                    if not image_path.is_file(): raise FileNotFoundError(f"Image not found: {image_path}")
+                    image = Image.open(image_path)
+                    image = exif_transpose(image)
+                else:
+                    raise TypeError(f"Unexpected type for image_source: {type(image_source)}")
+
+                # Handle prompts for directory/dataset loading
+                if self.custom_instance_prompts:
+                    # Ensure custom_instance_prompts was repeated correctly in __init__
+                    prompt_idx = index % len(self.custom_instance_prompts) # Index within original prompts list
+                    prompt = self.custom_instance_prompts[prompt_idx]
+                else:
+                    prompt = self.instance_prompt
+
+                # Handle alpha mask extraction if required
+                if self.alpha_mask_required and image.mode == "RGBA":
+                    try:
+                        alpha = image.split()[-1]
+                        mask_np = np.array(alpha, dtype=np.uint8)
+                        mask_np = (mask_np > 127).astype(np.uint8)
+                        mask = Image.fromarray(mask_np * 255, mode='L') # Convert back to PIL Image (L mode)
+                        image = image.convert("RGB") # Convert image after extracting alpha
+                    except Exception as e:
+                        logger.warning(f"Could not process alpha channel for source: {image_source}. Error: {e}")
+                        mask = None # Reset mask on error
+                        if image.mode != "RGB": image = image.convert("RGB")
+                elif image.mode != "RGB":
+                     image = image.convert("RGB") # Convert other modes to RGB if no alpha needed/present
+
+            # --- Common Image/Mask Preprocessing ---
+            if image is None: raise ValueError("Instance image could not be loaded.")
+
+            if image.mode != "RGB": image = image.convert("RGB") # Final check
+            if mask is not None and mask.mode != "L": mask = mask.convert("L") # Ensure mask is grayscale
+
+            # Apply geometric transforms (Resize, Crop, Flip)
+            apply_flip = self.args.random_flip and random.random() < 0.5
+
+            # Resize
+            image = self.train_resize(image)
+            # Use NEAREST for mask resizing to preserve binary nature
+            if mask: mask = transforms.functional.resize(mask, self.train_resize.size, interpolation=transforms.InterpolationMode.NEAREST)
+
+            # Flip
+            if apply_flip:
+                image = self.train_flip(image)
+                if mask: mask = self.train_flip(mask)
+
+            # Crop
+            if self.args.center_crop:
+                image = self.train_crop(image)
+                if mask: mask = self.train_crop(mask)
+            else:
+                # Get crop parameters based on image
+                y1, x1, h, w = self.train_crop.get_params(image, (self.args.resolution, self.args.resolution))
+                # Apply crop to image and mask with same parameters
+                image = crop(image, y1, x1, h, w)
+                if mask: mask = crop(mask, y1, x1, h, w)
+
+            # Convert to Tensor and Normalize
+            image_tensor = self.train_transforms(image) # ToTensor + Normalize
+
+            # Convert Mask to Tensor
+            if mask is not None:
+                # Ensure mask is correct size after transforms
+                if mask.size != (self.size, self.size):
+                    logger.warning(f"Resizing mask to ({self.size}, {self.size}) after transforms using NEAREST.")
+                    mask = mask.resize((self.size, self.size), Image.NEAREST)
+                mask_tensor = transforms.functional.to_tensor(mask) # Just ToTensor, no normalization
+                # Ensure mask is binary after potential interpolation artifacts
+                mask_tensor = (mask_tensor > 0.5).float()
+            else:
+                # Create default mask (all ones)
+                mask_tensor = torch.ones(1, self.size, self.size)
+
+            return {"image": image_tensor, "prompt": prompt, "mask": mask_tensor}
+
+        except Exception as e:
+            logger.error(f"Could not load/process instance data for index {index} (source: {source_info}). Error: {e}", exc_info=True)
+            return None # Signal failure
+
+    def _load_and_process_class(self, index):
+        """Helper function to load and process class image and prompt."""
+        if not self.class_data_root or not self.class_images_path: return None
+
+        class_image_path = "N/A"
+        try:
+            # Use index directly as class_images_path is already repeated
+            class_image_path = self.class_images_path[index]
+            class_image = Image.open(class_image_path)
+            class_image = exif_transpose(class_image)
+
+            if not class_image.mode == "RGB":
+                class_image = class_image.convert("RGB")
+
+            # Apply class image transforms (defined in __init__)
+            # These typically don't include random flipping
+            image_tensor = self.class_image_transforms(class_image)
+
+            return {"image": image_tensor, "prompt": self.class_prompt, "mask": None} # Mask is None for class images
+
+        except Exception as e:
+            logger.error(f"Could not load/process class image for index {index} (path: {class_image_path}). Error: {e}", exc_info=True)
+            return None # Signal failure
+
 
     def __getitem__(self, index):
         example = {}
-        # Переменная теперь может содержать путь или объект Image
-        image_source = self.instance_paths_repeated[index % self.num_instance_images]
+        instance_data = None
+        class_data = None
 
-        try:
-            # Проверяем тип источника изображения
-            if isinstance(image_source, Image.Image):
-                # Если это уже объект PIL Image, используем его напрямую
-                image = image_source.copy() # Копируем на всякий случай, чтобы не изменить оригинал в кэше datasets
-            elif isinstance(image_source, (str, Path)):
-                # Если это строка или Path, открываем файл
-                image = Image.open(image_source)
-                # exif_transpose имеет смысл только при открытии из файла
-                image = exif_transpose(image)
-            else:
-                # Обрабатываем непредвиденный тип, если нужно
-                raise TypeError(f"Unexpected type for image_source: {type(image_source)} from {self.instance_paths_repeated}")
+        # Determine indices within the *repeated* lists
+        instance_index = index % self.num_instance_images
+        class_index = -1
+        if self.class_data_root is not None:
+             class_index = index % self.num_class_images
 
-            # --- Дальнейшая обработка 'image' остается прежней ---
-            # (Извлечение альфа-канала, конвертация в RGB, трансформации)
+        # --- Load Instance Data ---
+        # Always try to load instance data, as it might be needed even if index maps primarily to class
+        instance_data = self._load_and_process_instance(instance_index)
+        if instance_data is None:
+             logger.warning(f"Skipping index {index} due to instance loading failure.")
+             return None # Skip if instance loading failed
 
-            alpha_mask_np = None
-            if self.alpha_mask_required: # Use the flag
-                if image.mode == "RGBA":
-                    try:
-                        alpha = image.split()[-1]
-                        alpha_mask_np = np.array(alpha, dtype=np.uint8)
-                        alpha_mask_np = (alpha_mask_np > 127).astype(np.uint8) # Threshold 127 for binarization
-                        image = image.convert("RGB")
-                    except Exception as e:
-                        logger.warning(f"Could not process alpha channel for source: {image_source}. Using RGB only. Error: {e}")
-                        if image.mode != "RGB":
-                            image = image.convert("RGB")
-                        alpha_mask_np = None # Reset mask on error
-                elif image.mode != "RGB": # If not RGBA but also not RGB, convert
-                    logger.warning(f"Image source {image_source} is not RGB or RGBA ({image.mode}). Converting to RGB.")
-                    image = image.convert("RGB")
-            # Если маскирование не требуется, но изображение не RGB, конвертируем
-            elif image.mode != "RGB":
-                 image = image.convert("RGB")
+        example["instance_images"] = instance_data["image"]
+        example["instance_prompt"] = instance_data["prompt"]
+        example["instance_masks"] = instance_data["mask"]
 
+        # --- Load Class Data (if prior preservation is enabled) ---
+        if self.class_data_root is not None:
+            class_data = self._load_and_process_class(class_index)
+            if class_data is None:
+                 logger.warning(f"Skipping index {index} due to class loading failure.")
+                 return None # Skip if class loading failed (strict prior preservation)
 
-            # Применяем трансформации к RGB изображению
-            if not image.mode == "RGB": # Финальная проверка перед трансформациями
-                 image = image.convert("RGB")
+            example["class_images"] = class_data["image"]
+            example["class_prompt"] = class_data["prompt"]
+            example["class_masks"] = class_data["mask"] # Should be None
 
-            # --- Применение трансформаций ---
-            image = self.train_resize(image)
-            if args.random_flip and random.random() < 0.5:
-                image = self.train_flip(image)
-            if args.center_crop:
-                y1 = max(0, int(round((image.height - args.resolution) / 2.0)))
-                x1 = max(0, int(round((image.width - args.resolution) / 2.0)))
-                image = self.train_crop(image)
-            else:
-                y1, x1, h, w = self.train_crop.get_params(image, (args.resolution, args.resolution))
-                image = crop(image, y1, x1, h, w)
-            image_tensor = self.train_transforms(image)
-            # --- Конец трансформаций ---
-
-            example["instance_images"] = image_tensor
-            example["instance_masks"] = alpha_mask_np # Добавляем маску (может быть None)
-
-            # --- Обработка промптов и классовых изображений (остается без изменений) ---
-            if self.custom_instance_prompts:
-                 # ... (existing code for handling custom_instance_prompts) ...
-                 # Убедитесь, что эта логика совместима, если вы ее используете
-                 # raise NotImplementedError("Custom instance prompts not fully checked with alpha mask")
-                prompt_index = index % len(self.custom_instance_prompts) # Handle potential index mismatch if lengths differ
-                example["instance_prompt"] = self.custom_instance_prompts[prompt_index]
-            else:
-                example["instance_prompt"] = self.instance_prompt
-
-            if self.class_data_root:
-                # ... (existing code for class images, оно должно работать, т.к. class_images_path - это пути) ...
-                try: # Error handling for class images
-                    class_image_path = self.class_images_path[index % self.num_class_images]
-                    class_image = Image.open(class_image_path)
-                    class_image = exif_transpose(class_image)
-                    if not class_image.mode == "RGB":
-                        class_image = class_image.convert("RGB")
-                    example["class_images"] = self.class_image_transforms(class_image) # Use separate transforms
-                    example["class_prompt"] = self.class_prompt
-                except Exception as e:
-                    logger.error(f"Could not load/process class image at path: {class_image_path}. Error: {e}")
-                    example["class_images"] = None
-                    example["class_prompt"] = None # Also None to avoid mismatch
-                # Add None mask for class images as they shouldn't be masked
-                example["class_masks"] = None
-
-        except Exception as e:
-            # Логируем исходный источник для ясности
-            logger.error(f"Could not load/process image source: {image_source}. Error: {e}")
-            # Возвращаем None, чтобы пропустить этот пример в collate_fn
-            return None
+        # Final check: ensure required keys exist based on prior preservation status
+        if self.class_data_root is not None:
+            # Both instance and class data must be present if prior preservation is on
+            if "instance_images" not in example or "class_images" not in example:
+                logger.error(f"Data missing in prior preservation mode for index {index}. Keys: {example.keys()}")
+                return None
+        elif "instance_images" not in example:
+             # Only instance data is required if prior preservation is off
+             logger.error(f"Instance data missing for index {index}. Keys: {example.keys()}")
+             return None
 
         return example
-        return example
 
 
-def collate_fn(examples, with_prior_preservation=False, vae_scale_factor=8): # Added vae_scale_factor
+# Need F from torch.nn.functional for interpolation
+import torch.nn.functional as F
+
+def collate_fn(examples, with_prior_preservation=False, vae_scale_factor=8):
     # Filter None values that might come from __getitem__ on errors
     examples = [e for e in examples if e is not None]
     if not examples:
         return None # Return None if the whole batch is corrupted
 
-    pixel_values = [example["instance_images"] for example in examples]
-    prompts = [example["instance_prompt"] for example in examples]
-    # --- Modification: Collect masks ---
-    masks = [example["instance_masks"] for example in examples]
-    # --- End modification ---
+    # Extract data for instance images
+    instance_pixel_values = [example["instance_images"] for example in examples]
+    instance_prompts = [example["instance_prompt"] for example in examples]
+    # instance_masks are tensors of shape [1, H, W]
+    instance_masks = [example["instance_masks"] for example in examples]
 
-    # Concat class and instance examples for prior preservation.
+    batch = {} # Initialize batch dictionary
+
+    # Handle prior preservation
     if with_prior_preservation:
         # Filter examples where class_images loaded successfully
         valid_class_examples = [e for e in examples if e.get("class_images") is not None]
         if valid_class_examples:
-             pixel_values += [example["class_images"] for example in valid_class_examples]
-             prompts += [example["class_prompt"] for example in valid_class_examples]
-             # Add None masks for class images
-             masks += [example["class_masks"] for example in valid_class_examples] # Should be [None, None, ...]
+             class_pixel_values = [example["class_images"] for example in valid_class_examples]
+             class_prompts = [example["class_prompt"] for example in valid_class_examples]
+             # Class masks are None as returned by _load_and_process_class
+             class_masks = [example.get("class_masks", None) for example in valid_class_examples] # Should be list of Nones
+
+             # Combine instance and class data
+             pixel_values = instance_pixel_values + class_pixel_values
+             prompts = instance_prompts + class_prompts
+             # Combine instance masks and placeholders (None) for class masks
+             masks_to_process = instance_masks + class_masks
         else:
-             # If no valid class images, prior preservation is not possible for this batch
-             logger.warning("Prior preservation enabled, but no valid class images found in this batch.")
-             with_prior_preservation = False # Disable for this batch
+             # If no valid class images, proceed without prior preservation for this batch
+             logger.warning("Prior preservation enabled, but no valid class images found in this batch. Proceeding without prior preservation.")
+             pixel_values = instance_pixel_values
+             prompts = instance_prompts
+             masks_to_process = instance_masks
+             # Keep with_prior_preservation flag as True, loss calculation might still use it
+    else:
+        # No prior preservation, just use instance data
+        pixel_values = instance_pixel_values
+        prompts = instance_prompts
+        masks_to_process = instance_masks
 
 
-    pixel_values = torch.stack(pixel_values)
-    pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+    # Stack pixel values
+    batch["pixel_values"] = torch.stack(pixel_values).to(memory_format=torch.contiguous_format).float()
 
-    # --- Modification: Process and resize masks ---
-    alpha_masks_tensor = None
-    if any(m is not None for m in masks): # If at least one mask exists
-        batch_masks = []
+    # Store prompts (tokenization happens later in the main loop)
+    batch["prompts"] = prompts
+
+    # --- Process and resize masks ---
+    batch_masks_tensor = None
+    if masks_to_process: # Check if there are any masks/placeholders to process
+        processed_masks = []
+        h, w = -1, -1 # Initialize height and width
+
+        # Find the dimensions from the first available tensor (pixel_values)
+        if batch["pixel_values"].numel() > 0:
+             h, w = batch["pixel_values"].shape[-2:]
+        else: # Should not happen if examples is not empty
+             raise ValueError("Cannot determine mask size, pixel_values tensor is empty.")
+
         # Determine target latent size
-        latent_height = args.resolution // vae_scale_factor
-        latent_width = args.resolution // vae_scale_factor
+        latent_height = h // vae_scale_factor
+        latent_width = w // vae_scale_factor
 
-        for mask_np in masks:
-            if mask_np is not None:
-                # Convert NumPy to PyTorch tensor
-                mask_tensor = torch.from_numpy(mask_np).float().unsqueeze(0).unsqueeze(0) # [1, 1, H, W]
-                # Resize to latent size
-                resized_mask = F.interpolate(mask_tensor, size=(latent_height, latent_width), mode='nearest') # Use nearest for binary mask
-                batch_masks.append(resized_mask)
+        for mask_tensor in masks_to_process:
+            if mask_tensor is None:
+                # Create default 'all ones' mask (for class images or failed instance masks)
+                # Ensure it matches the expected channel dim (1) and H, W
+                processed_masks.append(torch.ones(1, h, w))
             else:
-                # If no mask, create a tensor of ones (to not affect loss)
-                batch_masks.append(torch.ones(1, 1, latent_height, latent_width, dtype=torch.float32))
-        # Important: Ensure the number of masks matches pixel_values after prior preservation filtering
-        if len(batch_masks) == pixel_values.shape[0]:
-             alpha_masks_tensor = torch.cat(batch_masks, dim=0) # [B_total, 1, LatentH, LatentW]
+                # Ensure mask tensor has channel dim: [1, H, W]
+                if mask_tensor.ndim == 2: # If mask is [H, W]
+                    mask_tensor = mask_tensor.unsqueeze(0)
+                # Ensure mask tensor has the correct H, W (might be redundant after __getitem__)
+                if mask_tensor.shape[-2:] != (h, w):
+                     logger.warning(f"Mask tensor has unexpected shape {mask_tensor.shape}, expected H={h}, W={w}. Resizing with NEAREST.")
+                     mask_tensor = transforms.functional.resize(mask_tensor, [h, w], interpolation=transforms.InterpolationMode.NEAREST)
+
+                processed_masks.append(mask_tensor)
+
+        # Stack all masks (including defaults)
+        # Ensure the number of processed masks matches the number of pixel values
+        if len(processed_masks) != batch["pixel_values"].shape[0]:
+             logger.error(f"Mismatch between number of pixel values ({batch['pixel_values'].shape[0]}) and processed masks ({len(processed_masks)}). Skipping mask processing for this batch.")
+             batch_masks_tensor = None # Indicate failure to process masks
         else:
-             logger.error(f"Mismatch between number of pixel values ({pixel_values.shape[0]}) and masks ({len(batch_masks)}) after prior preservation handling.")
-             # Return batch without masks in case of error
-             alpha_masks_tensor = None
+             batch_masks_tensor = torch.stack(processed_masks) # Shape [B, 1, H, W]
 
-    # --- End modification ---
+             # Resize masks to latent dimensions using nearest neighbor interpolation
+             # Input shape [B, 1, H, W] -> Output shape [B, 1, latent_H, latent_W]
+             resized_masks = F.interpolate(
+                 batch_masks_tensor,
+                 size=(latent_height, latent_width),
+                 mode="nearest" # Use nearest to keep mask binary
+             )
 
-    batch = {"pixel_values": pixel_values, "prompts": prompts}
-    if alpha_masks_tensor is not None:
-        batch["alpha_masks"] = alpha_masks_tensor # Add to batch
+             # Threshold again after interpolation just in case (shouldn't be needed with nearest)
+             final_masks = (resized_masks > 0.5).float()
+             batch_masks_tensor = final_masks # Store final masks [B, 1, latent_H, latent_W]
 
-    # Add flag indicating if prior preservation was active for this batch
-    batch["is_prior_preservation_batch"] = with_prior_preservation
+    # Store the final processed masks (or None if processing failed)
+    batch["pixel_masks"] = batch_masks_tensor
+
+    # Remove the old flag, loss calculation should handle the batch structure
+    # batch["is_prior_preservation_batch"] = with_prior_preservation
 
     return batch
 
@@ -2411,50 +2735,59 @@ def main(args):
                 # flow matching loss
                 target = noise - model_input
 
-                is_prior_batch = batch.get("is_prior_preservation_batch", False) # Get flag from batch
+                # Check if prior preservation is active for this batch
+                # Assumes collate_fn correctly doubled the batch size if prior preservation was successful
+                is_prior_batch = with_prior_preservation and model_pred.shape[0] == target.shape[0] * 2
 
-                if is_prior_batch: # Use flag from batch
-                    # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
+                # Get masks from batch (should exist, potentially as all ones)
+                pixel_masks = batch.get("pixel_masks") # Use the new key from collate_fn
+                if pixel_masks is None:
+                     # Fallback: create all-ones mask if missing from batch for some reason
+                     logger.warning("pixel_masks not found in batch, creating default all-ones mask.")
+                     latent_h, latent_w = model_pred.shape[-2:] # Get shape from prediction
+                     # Ensure batch size matches model_pred batch size
+                     mask_batch_size = model_pred.shape[0]
+                     pixel_masks = torch.ones(mask_batch_size, 1, latent_h, latent_w, device=model_pred.device, dtype=model_pred.dtype)
+                else:
+                     pixel_masks = pixel_masks.to(model_pred.device, dtype=model_pred.dtype) # Ensure device and dtype match
+
+                if is_prior_batch:
+                    # Chunk predictions, targets, and masks for prior preservation loss calculation
+                    # Ensure chunking is possible (batch size must be even)
+                    if model_pred.shape[0] % 2 != 0:
+                         logger.error(f"Prior preservation active but effective batch size ({model_pred.shape[0]}) is odd. Cannot compute prior loss correctly. Skipping batch.")
+                         continue # Skip this entire batch/step
+
                     model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
                     target, target_prior = torch.chunk(target, 2, dim=0)
-                    # --- Modification: Split mask too, if it exists ---
-                    if "alpha_masks" in batch and batch["alpha_masks"] is not None:
-                         # Ensure splitting is possible (batch size is even)
-                         if batch["alpha_masks"].shape[0] % 2 == 0:
-                              alpha_masks, prior_masks = torch.chunk(batch["alpha_masks"], 2, dim=0)
-                         else:
-                              # If odd, something might be wrong in collate_fn
-                              logger.warning("Batch size is odd during prior preservation, cannot split masks evenly. Skipping mask for prior loss.")
-                              alpha_masks = batch["alpha_masks"] # Use the whole mask for the main part
-                              prior_masks = None
-                    else:
-                         alpha_masks, prior_masks = None, None # Or tensors of ones
-                    # --- End modification ---
+                    pixel_masks, prior_masks = torch.chunk(pixel_masks, 2, dim=0) # pixel_masks now holds the instance part
 
-                    # Compute prior loss.
-                    prior_loss = (weighting.float() * (model_pred_prior.float() - target_prior.float()) ** 2)
-                    # --- Modification: Apply mask to prior_loss ---
-                    if prior_masks is not None:
-                         prior_loss = prior_loss * prior_masks.to(prior_loss.device, dtype=prior_loss.dtype)
-                    # --- End modification ---
-                    # Average prior loss after masking
-                    prior_loss = torch.mean(prior_loss.reshape(target_prior.shape[0], -1), 1)
-                    prior_loss = prior_loss.mean()
+                    # Compute prior loss (per pixel, weighted)
+                    prior_loss_pixel = (weighting.float() * (model_pred_prior.float() - target_prior.float()) ** 2)
+
+                    # Apply mask to prior loss (prior_masks should be all ones from collate_fn)
+                    masked_prior_loss_pixel = prior_loss_pixel * prior_masks
+
+                    # Calculate mean loss over unmasked pixels for prior loss
+                    # Sum over all dimensions except batch, divide by sum of mask elements per batch item
+                    prior_loss = masked_prior_loss_pixel.sum(dim=[1, 2, 3]) / prior_masks.sum(dim=[1, 2, 3]).clamp(min=1.0)
+                    prior_loss = prior_loss.mean() # Average over batch
+                else:
+                    # No prior preservation for this batch
+                    prior_loss = 0.0 # Initialize prior_loss to 0
 
 
-                # Compute regular loss.
-                loss = (weighting.float() * (model_pred.float() - target.float()) ** 2)
+                # Compute instance loss (per pixel, weighted)
+                # model_pred and target are already the instance parts if is_prior_batch is True
+                loss_pixel = (weighting.float() * (model_pred.float() - target.float()) ** 2)
 
-                # --- Modification: Apply mask to main loss ---
-                if "alpha_masks" in batch and batch["alpha_masks"] is not None:
-                    current_alpha_mask = alpha_masks if is_prior_batch else batch["alpha_masks"]
-                    if current_alpha_mask is not None:
-                         loss = loss * current_alpha_mask.to(loss.device, dtype=loss.dtype)
-                # --- End modification ---
+                # Apply mask to instance loss
+                # pixel_masks holds the correct mask (either instance part or full batch)
+                masked_loss_pixel = loss_pixel * pixel_masks
 
-                # Average loss after masking
-                loss = torch.mean(loss.reshape(target.shape[0], -1), 1)
-                loss = loss.mean()
+                # Calculate mean loss over unmasked pixels for instance loss
+                loss = masked_loss_pixel.sum(dim=[1, 2, 3]) / pixel_masks.sum(dim=[1, 2, 3]).clamp(min=1.0)
+                loss = loss.mean() # Average over batch
 
                 if is_prior_batch:
                     # Add the prior loss to the instance loss.
